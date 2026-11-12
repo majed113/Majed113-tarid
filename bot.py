@@ -401,7 +401,6 @@ def manage_trade(state, trade, snapshot):
     price = snapshot["price"]
     candle = snapshot["candles5"][-1]
 
-    # کندل ورود نباید برای حد ضرر و حد سود بررسی شود
     if candle["time"] <= trade.get("last_managed_candle", 0):
         return
 
@@ -462,6 +461,7 @@ def manage_trade(state, trade, snapshot):
 
             if trade not in state["open_trades"]:
                 return
+
 
 
 
