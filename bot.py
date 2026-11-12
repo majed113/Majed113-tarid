@@ -24,14 +24,41 @@ REAL_ORDERS_ENABLED = False
 
 # ===== دریافت اطلاعات عمومی بازار =====
 
-def get_market_data():
-    url = f"{API_URL}/api/v3/ticker/24hr"
 
-    response = requests.get(url, timeout=15)
+def get_market_data():
+    base = "https://api.ourbit.com/api/v3"
+
+    # دریافت مشخصات بازارهای مجاز
+    info_response = requests.get(
+        f"{base}/exchangeInfo", timeout=15
+    )
+    info_response.raise_for_status()
+    info = info_response.json()
+
+    allowed = set()
+
+    for item in info.get("symbols", []):
+        symbol = item.get("symbol", "")
+        base_asset = item.get("baseAsset", "")
+
+        if (
+            item.get("status") == "ENABLED"
+            and item.get("isSpotTradingAllowed") is True
+            and item.get("quoteAsset") == "USDT"
+            and symbol.endswith("USDT")
+            and "~" not in symbol
+            and base_asset
+            and not base_asset.endswith(("YES", "NO"))
+        ):
+            allowed.add(symbol)
+
+    # دریافت آمار بازار
+    response = requests.get(
+        f"{base}/ticker/24hr", timeout=15
+    )
     response.raise_for_status()
 
     data = response.json()
-
     if isinstance(data, dict):
         data = [data]
 
@@ -40,15 +67,22 @@ def get_market_data():
     for item in data:
         symbol = item.get("symbol", "")
 
-        if not symbol.endswith("USDT"):
+        if symbol not in allowed:
             continue
 
         try:
             price = float(item["lastPrice"])
-            change = float(item["priceChangePercent"]) * 100
-            volume = float(item.get("volume") or 0)
+            raw_change = float(item["priceChangePercent"])
+            volume = float(item.get("quoteVolume") or 0)
 
-            if price <= 0:
+            # تبدیل درصد اعشاری به درصد واقعی
+            change = (
+                raw_change * 100
+                if abs(raw_change) <= 1
+                else raw_change
+            )
+
+            if price <= 0 or volume < 10000:
                 continue
 
             markets.append({
