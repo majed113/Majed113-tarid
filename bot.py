@@ -26,13 +26,13 @@ MAX_DAILY_LOSS = 0.06
 MAX_POSITION_SIZE = 40.0
 MAX_OPEN_TRADES = 3
 
-FEE_RATE = 0.002  # فرض کارمزد 0.2 درصد در هر سمت
+FEE_RATE = 0.002
 MIN_TRADE_SIZE = 5.0
 SCAN_INTERVAL = 60
 
 STATE_FILE = "paper_state.json"
 
-# سفارش واقعی همیشه خاموش است
+# سفارش واقعی همیشه غیرفعال است
 REAL_ORDERS_ENABLED = False
 
 
@@ -53,23 +53,43 @@ def new_state():
         "peak_equity": START_BALANCE,
         "max_drawdown": 0.0,
         "daily_date": datetime.now(timezone.utc).date().isoformat(),
-        "daily_start_equity": START_BALANCE
+        "daily_start_equity": START_BALANCE,
+        "last_entry_candle": {}
     }
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
+    default = new_state()
 
-            if isinstance(state, dict) and "cash" in state:
-                return state
+    if not os.path.exists(STATE_FILE):
+        return default
 
-        except Exception as error:
-            print("State load error:", error)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
 
-    return new_state()
+        if not isinstance(saved, dict):
+            return default
+
+        # سازگاری با فایل ذخیره نسخه قبلی
+        for key, value in default.items():
+            if key not in saved:
+                saved[key] = value
+
+        if not isinstance(saved["open_trades"], list):
+            saved["open_trades"] = []
+
+        if not isinstance(saved["history"], list):
+            saved["history"] = []
+
+        if not isinstance(saved["last_entry_candle"], dict):
+            saved["last_entry_candle"] = {}
+
+        return saved
+
+    except Exception as error:
+        print("State load error:", error)
+        return default
 
 
 def save_state(state):
@@ -91,6 +111,7 @@ def get_json(path, params=None):
         params=params,
         timeout=15
     )
+
     response.raise_for_status()
     return response.json()
 
@@ -120,7 +141,7 @@ def get_klines(symbol, interval, limit=100):
                 "close_time": int(item[6])
             }
 
-            # فقط کندل بسته‌شده
+            # فقط کندل بسته شده
             if candle["close_time"] < now_ms:
                 candles.append(candle)
 
@@ -163,6 +184,7 @@ def ema(values, period):
         return []
 
     result = []
+
     current = sum(values[:period]) / period
     result.append(current)
 
@@ -173,6 +195,7 @@ def ema(values, period):
             value * multiplier
             + current * (1 - multiplier)
         )
+
         result.append(current)
 
     return result
@@ -206,6 +229,7 @@ def calculate_rsi(values, period=14):
         return 100.0
 
     rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
 
@@ -233,7 +257,6 @@ def calculate_atr(candles, period=14):
 # =====================================
 # TRADING SIGNAL
 # =====================================
-
 
 def analyze(snapshot):
     candles5 = snapshot["candles5"]
@@ -267,7 +290,10 @@ def analyze(snapshot):
     if not trend_up or not entry_confirmed:
         return None
 
-    stop_distance = max(atr * 1.5, price * 0.005)
+    stop_distance = max(
+        atr * 1.5,
+        price * 0.005
+    )
 
     if stop_distance / price > 0.03:
         return None
@@ -315,16 +341,17 @@ def update_daily(state, prices):
 
     if peak > 0:
         drawdown = (peak - equity) / peak
+
         state["max_drawdown"] = max(
             state["max_drawdown"],
             drawdown
         )
 
-    save_state(state)
-
     daily_loss = (
         state["daily_start_equity"] - equity
     )
+
+    save_state(state)
 
     return daily_loss >= (
         state["daily_start_equity"] * MAX_DAILY_LOSS
@@ -335,9 +362,79 @@ def update_daily(state, prices):
 # OPEN PAPER TRADE
 # =====================================
 
-
 def open_trade(state, symbol, signal):
+    if len(state["open_trades"]) >= MAX_OPEN_TRADES:
+        return False
 
+    if any(
+        trade["symbol"] == symbol
+        for trade in state["open_trades"]
+    ):
+        return False
+
+    candle_time = signal["candle_time"]
+
+    previous_entry = state["last_entry_candle"].get(
+        symbol,
+        0
+    )
+
+    # جلوگیری از ورود تکراری روی یک کندل
+    if candle_time <= previous_entry:
+        return False
+
+    entry = signal["price"]
+    stop = signal["stop"]
+
+    stop_percent = (entry - stop) / entry
+
+    if stop_percent <= 0:
+        return False
+
+    risk_money = START_BALANCE * RISK_PER_TRADE
+
+    notional = min(
+        MAX_POSITION_SIZE,
+        risk_money / stop_percent
+    )
+
+    notional = min(
+        notional,
+        state["cash"] / (1 + FEE_RATE)
+    )
+
+    if notional < MIN_TRADE_SIZE:
+        return False
+
+    quantity = notional / entry
+    entry_fee = notional * FEE_RATE
+
+    state["cash"] -= notional + entry_fee
+
+    trade = {
+        "symbol": symbol,
+        "entry": entry,
+        "stop": stop,
+        "initial_stop": stop,
+        "original_qty": quantity,
+        "remaining_qty": quantity,
+        "remaining_cost": notional + entry_fee,
+        "target1": entry + (entry - stop),
+        "target2": entry + 2 * (entry - stop),
+        "target3": entry + 3 * (entry - stop),
+        "targets_hit": [],
+        "realized_pnl": 0.0,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "last_managed_candle": candle_time
+    }
+
+    state["open_trades"].append(trade)
+
+    state["last_entry_candle"][symbol] = candle_time
+
+    save_state(state)
+
+    return True
 
 
 # =====================================
@@ -396,11 +493,10 @@ def close_quantity(state, trade, quantity, price, reason):
 # MANAGE OPEN TRADES
 # =====================================
 
-
 def manage_trade(state, trade, snapshot):
-    price = snapshot["price"]
     candle = snapshot["candles5"][-1]
 
+    # کندل ورود نباید برای حد سود یا ضرر بررسی شود
     if candle["time"] <= trade.get("last_managed_candle", 0):
         return
 
@@ -409,6 +505,8 @@ def manage_trade(state, trade, snapshot):
     low = candle["low"]
     high = candle["high"]
 
+    # در برخورد هم‌زمان با حد ضرر و هدف،
+    # خروج محافظه‌کارانه با حد ضرر انجام می‌شود.
     if low <= trade["stop"]:
         close_quantity(
             state,
@@ -417,6 +515,7 @@ def manage_trade(state, trade, snapshot):
             trade["stop"],
             "STOP LOSS"
         )
+
         return
 
     targets = [
@@ -463,8 +562,6 @@ def manage_trade(state, trade, snapshot):
                 return
 
 
-
-
 # =====================================
 # BACKGROUND PAPER ENGINE
 # =====================================
@@ -474,11 +571,10 @@ async def paper_engine(app):
 
     while True:
         try:
-            state = load_state()
+            snapshots = {}
             prices = {}
 
-            snapshots = {}
-
+            # ابتدا دریافت اطلاعات بازار
             for symbol in SYMBOLS:
                 try:
                     snapshot = await asyncio.to_thread(
@@ -490,9 +586,16 @@ async def paper_engine(app):
                     prices[symbol] = snapshot["price"]
 
                 except Exception as error:
-                    print(symbol, "market error:", error)
+                    print(
+                        symbol,
+                        "market error:",
+                        error
+                    )
 
-            # مدیریت معاملات باز حتی پس از paper_off
+            # بعد از دریافت اطلاعات، وضعیت تازه خوانده می‌شود
+            state = load_state()
+
+            # مدیریت معاملات باز
             for trade in state["open_trades"][:]:
                 snapshot = snapshots.get(trade["symbol"])
 
@@ -508,11 +611,11 @@ async def paper_engine(app):
                 prices
             )
 
-            # فقط وقتی روشن باشد، معامله جدید باز می‌کند
+            # فقط در صورت روشن بودن موتور،
+            # معاملات آزمایشی جدید باز می‌شوند.
             if state["paper_enabled"] and not daily_limit_reached:
 
                 for symbol, snapshot in snapshots.items():
-
                     signal = analyze(snapshot)
 
                     if signal:
@@ -581,7 +684,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-
     prices = {}
 
     for trade in state["open_trades"]:
@@ -590,6 +692,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 get_price,
                 trade["symbol"]
             )
+
         except Exception:
             prices[trade["symbol"]] = trade["entry"]
 
@@ -614,7 +717,8 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "حد ضرر: الزامی\n"
         "حد سود: سه مرحله‌ای\n"
         "کارمزد فرضی: 0.2٪ در هر سمت\n"
-        "حالت: Paper Trading"
+        "حالت: Paper Trading\n"
+        "سفارش واقعی: غیرفعال"
     )
 
 
@@ -648,7 +752,9 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def paper_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
+
     state["paper_enabled"] = True
+
     save_state(state)
 
     await update.message.reply_text(
@@ -660,7 +766,9 @@ async def paper_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def paper_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
+
     state["paper_enabled"] = False
+
     save_state(state)
 
     await update.message.reply_text(
